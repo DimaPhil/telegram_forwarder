@@ -147,7 +147,7 @@ After=network.target
 [Service]
 User=yourusername
 WorkingDirectory=/path/to/telegram-forwarder
-ExecStart=/usr/bin/python3 /path/to/telegram-forwarder/telegram_forwarder.py
+ExecStart=/usr/bin/python3 /path/to/telegram-forwarder/forwarder.py
 Restart=on-failure
 RestartSec=10
 
