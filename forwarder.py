@@ -422,7 +422,7 @@ class TelegramForwarder:
                         # Direct forward (preserves original message formatting, attachments, etc.)
                         # Note: forward_messages() doesn't support reply_to, so we need to handle it separately
                         forwarded_msg = await self.client.forward_messages(
-                            to_chat,
+                            int(to_chat),
                             message
                         )
                         
@@ -434,7 +434,7 @@ class TelegramForwarder:
                             try:
                                 # Edit the message to make it a reply in the topic
                                 await self.client.edit_message(
-                                    entity=to_chat,
+                                    entity=int(to_chat),
                                     message=first_msg,
                                     reply_to=to_topic
                                 )
