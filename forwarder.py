@@ -10,9 +10,10 @@ import sys
 import json
 import logging
 import asyncio
+import re
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession, SQLiteSession
-from telethon.tl.types import PeerChannel, PeerChat, PeerUser, Channel
+from telethon.tl.types import PeerChannel, PeerChat, PeerUser, Channel, MessageEntityTextUrl, MessageMediaWebPage
 from telethon.tl.functions.channels import GetFullChannelRequest, GetMessagesRequest
 from telethon.tl.functions.messages import GetFullChatRequest, GetMessagesRequest as GetMessagesRequestMsgs
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
@@ -38,6 +39,13 @@ CONFIG_FILE = 'config.json'
 FORWARDING_RULES_FILE = 'forwarding_rules.json'
 SESSION_FILE = 'telegram_session'
 
+# Regex pattern for Telegram message links
+# Matches formats like:
+# - https://t.me/c/1234567890/12345 (private/channel messages)
+# - https://t.me/username/12345 (public channel/group messages) 
+# - https://t.me/c/1234567890/12345/67890 (topic messages)
+TG_LINK_PATTERN = re.compile(r'https?://t\.me/(?:c/(\d+)|([^/]+))/(\d+)(?:/(\d+))?')
+
 class TelegramForwarder:
     def __init__(self, config_path=CONFIG_FILE, rules_path=FORWARDING_RULES_FILE, session_file=SESSION_FILE):
         self.config_path = config_path
@@ -60,6 +68,8 @@ class TelegramForwarder:
         self.chat_topics = {}
         # Cache for channels that don't allow forwarding
         self.no_forward_chats = set()
+        # Cache for resolved message links
+        self.resolved_message_links = {}
         
     def _setup_proxy(self):
         """Setup proxy from config (if available)"""
@@ -226,8 +236,8 @@ class TelegramForwarder:
         self.chat_topics[chat_id][topic_id] = fallback_name
         return fallback_name
     
-    async def _should_forward(self, chat_id, topic_id=None):
-        """Determine if a message from the given chat/topic should be forwarded"""
+    async def _should_forward(self, chat_id, topic_id=None, user_id=None):
+        """Determine if a message from the given chat/topic and user should be forwarded"""
         # Normalize chat_id format for comparison (handle both -100xxx and -10xxx formats)
         str_chat_id = str(chat_id)
         
@@ -268,6 +278,12 @@ class TelegramForwarder:
         # Check for chat-level forwarding rules
         if "*" in matching_rules:
             for target in matching_rules["*"]:
+                # Check if user_id filter is defined and if the message is from an allowed user
+                user_ids = target.get("user_ids", [])
+                if user_ids and user_id is not None and user_id not in user_ids:
+                    logger.debug(f"User {user_id} not in allowed users list {user_ids} for chat {str_chat_id}")
+                    continue
+                
                 result.append({
                     "to_chat": target["chat_id"],
                     "to_topic": target.get("topic_id"),
@@ -279,13 +295,19 @@ class TelegramForwarder:
             str_topic_id = str(topic_id)
             if str_topic_id in matching_rules:
                 for target in matching_rules[str_topic_id]:
+                    # Check if user_id filter is defined and if the message is from an allowed user
+                    user_ids = target.get("user_ids", [])
+                    if user_ids and user_id is not None and user_id not in user_ids:
+                        logger.debug(f"User {user_id} not in allowed users list {user_ids} for chat {str_chat_id}, topic {topic_id}")
+                        continue
+                    
                     result.append({
                         "to_chat": target["chat_id"],
                         "to_topic": target.get("topic_id"),
                         "include_source": True
                     })
         
-        logger.debug(f"Found {len(result)} forwarding rules for chat {str_chat_id}, topic {topic_id}")
+        logger.debug(f"Found {len(result)} forwarding rules for chat {str_chat_id}, topic {topic_id}, user {user_id}")
         return result
 
     async def _can_forward_from_chat(self, chat_id):
@@ -312,13 +334,281 @@ class TelegramForwarder:
         # Assume we can forward if no restrictions found
         return True
     
+    async def _extract_message_links(self, message_text):
+        """Extract Telegram message links from text"""
+        if not message_text:
+            return []
+
+        links = []
+        for match in TG_LINK_PATTERN.finditer(message_text):
+            channel_id, username, topic_id, msg_id = match.groups()
+            
+            # Store the link details
+            link_data = {
+                'full_match': match.group(0),
+                'message_id': int(msg_id)
+            }
+            
+            # Handle channel ID (numeric format)
+            if channel_id:
+                # Note: Don't add -100 prefix here, will handle in _fetch_linked_message
+                link_data['chat_id'] = channel_id
+            # Handle username format
+            elif username:
+                link_data['username'] = username
+                
+            # Handle topic ID if present
+            if topic_id:
+                link_data['topic_id'] = int(topic_id)
+                
+            links.append(link_data)
+            logger.debug(f"Extracted message link: {link_data}")
+            
+        return links
+    
+    async def _fetch_linked_message(self, link_data):
+        """Fetch a message referenced by a Telegram link"""
+        # Check cache first
+        cache_key = f"{link_data.get('chat_id', link_data.get('username'))}-{link_data['message_id']}"
+        if cache_key in self.resolved_message_links:
+            return self.resolved_message_links[cache_key]
+            
+        try:
+            # Determine the chat
+            chat = None
+            if 'chat_id' in link_data:
+                # For private/channel links with numeric IDs
+                chat_id = link_data['chat_id']
+                
+                # If the chat_id is from the t.me/c/1234 format, it may need the -100 prefix
+                if not str(chat_id).startswith('-100') and str(chat_id).isdigit():
+                    chat_id = f"-100{chat_id}"
+                
+                chat = await self._get_entity(chat_id)
+            else:
+                # For public links with username
+                chat = await self._get_entity(link_data['username'])
+                
+            if not chat:
+                logger.warning(f"Could not resolve chat for link: {link_data['full_match']}")
+                return None
+                
+            # Get the topic ID if available
+            topic_id = link_data.get('topic_id')
+            msg_id = link_data['message_id']
+            
+            # Try multiple approaches to fetch the message
+            message = None
+            
+            # APPROACH 1: Standard get_messages
+            try:
+                message = await self.client.get_messages(chat, ids=msg_id)
+                logger.debug(f"APPROACH 1 success for message {msg_id}: {message}")
+                
+                # Check if we got message text
+                if message and (
+                    (hasattr(message, 'message') and message.message) or
+                    (hasattr(message, 'text') and message.text) or
+                    (hasattr(message, 'raw_text') and message.raw_text)
+                ):
+                    logger.debug("APPROACH 1 retrieved message with text")
+                else:
+                    logger.debug("APPROACH 1 retrieved message without text")
+            except Exception as e:
+                logger.debug(f"APPROACH 1 failed: {str(e)}")
+            
+            # APPROACH 2: Use topic context if available
+            if topic_id and (not message or not getattr(message, 'message', None)):
+                try:
+                    message_with_topic = await self.client.get_messages(
+                        entity=chat,
+                        ids=msg_id,
+                        reply_to=topic_id
+                    )
+                    logger.debug(f"APPROACH 2 success for message {msg_id} in topic {topic_id}: {message_with_topic}")
+                    
+                    # If we got a better result, use it
+                    if message_with_topic and (
+                        (hasattr(message_with_topic, 'message') and message_with_topic.message) or
+                        (hasattr(message_with_topic, 'text') and message_with_topic.text) or
+                        (hasattr(message_with_topic, 'raw_text') and message_with_topic.raw_text)
+                    ):
+                        logger.debug("APPROACH 2 retrieved message with text")
+                        message = message_with_topic
+                    else:
+                        logger.debug("APPROACH 2 retrieved message without text")
+                except Exception as e:
+                    logger.debug(f"APPROACH 2 failed: {str(e)}")
+            
+            # APPROACH 3: Try to manually extract from the full message
+            if not message or not (
+                getattr(message, 'message', None) or 
+                getattr(message, 'text', None) or
+                getattr(message, 'raw_text', None)
+            ):
+                try:
+                    # Get the full message without client-side processing
+                    full_msg = await self.client(GetMessagesRequest(
+                        peer=chat,
+                        id=[msg_id]
+                    ))
+                    
+                    if full_msg and full_msg.messages and len(full_msg.messages) > 0:
+                        raw_message = full_msg.messages[0]
+                        logger.debug(f"APPROACH 3 retrieved raw message: {raw_message}")
+                        
+                        # If our first message is empty but raw message has text, use it
+                        if hasattr(raw_message, 'message') and raw_message.message:
+                            if not message:
+                                message = raw_message
+                            # Otherwise, copy the text to our original message
+                            elif hasattr(message, 'message'):
+                                message.message = raw_message.message
+                                logger.debug(f"APPROACH 3 added text from raw message: '{raw_message.message}'")
+                except Exception as e:
+                    logger.debug(f"APPROACH 3 failed: {str(e)}")
+            
+            # Final check
+            if not message:
+                logger.warning(f"Could not fetch message for link: {link_data['full_match']}")
+                return None
+            
+            # Debug logging for the message we're returning
+            logger.debug(f"Final message object: {message}")
+            logger.debug(f"message attribute: '{getattr(message, 'message', None)}'")
+            logger.debug(f"text attribute: '{getattr(message, 'text', None)}'")
+            logger.debug(f"raw_text attribute: '{getattr(message, 'raw_text', None)}'")
+            logger.debug(f"Has media: {message.media is not None}")
+            
+            # Let's add the message text as a custom attribute for easier access later
+            if hasattr(message, 'message') and message.message:
+                setattr(message, '_extracted_text', message.message)
+            elif hasattr(message, 'text') and message.text:
+                setattr(message, '_extracted_text', message.text)
+            elif hasattr(message, 'raw_text') and message.raw_text:
+                setattr(message, '_extracted_text', message.raw_text)
+            else:
+                setattr(message, '_extracted_text', '')
+            
+            logger.debug(f"Custom _extracted_text: '{getattr(message, '_extracted_text', '')}'")
+                
+            # Store in cache
+            self.resolved_message_links[cache_key] = message
+            return message
+            
+        except Exception as e:
+            logger.error(f"Error fetching linked message {link_data['full_match']}: {str(e)}")
+            return None
+    
+    async def _format_message_for_forwarding(self, message, is_reply=False, linked_from=None):
+        """Format a message for inclusion in a forwarded message"""
+        # Get sender information
+        try:
+            sender = await message.get_sender()
+            sender_name = getattr(sender, 'first_name', '') or ''
+            if getattr(sender, 'last_name', ''):
+                sender_name += f" {sender.last_name}"
+            if getattr(sender, 'username', ''):
+                sender_name += f" (@{sender.username})"
+            if not sender_name:
+                sender_name = f"User {sender.id}" if hasattr(sender, 'id') else "Unknown User"
+        except Exception as e:
+            logger.error(f"Error getting sender: {str(e)}")
+            sender_name = "Unknown User"
+            
+        # Prepare the formatted message
+        if is_reply:
+            prefix = "⤴️ **In reply to:**\n"
+        elif linked_from:
+            # Fix the formatting - make sure the colon is before the URL, not after
+            prefix = f"🔗 **Linked message:** {linked_from}\n"
+        else:
+            prefix = ""
+        
+        # Get message text - using multiple methods to ensure we get the content
+        message_text = ""
+        
+        # First check if we have the custom extracted text
+        if hasattr(message, '_extracted_text') and message._extracted_text:
+            message_text = message._extracted_text
+            logger.debug(f"Using _extracted_text: '{message_text}'")
+        # Then try standard message attributes
+        elif hasattr(message, 'message') and message.message:
+            message_text = message.message
+            logger.debug(f"Using message.message: '{message_text}'")
+        elif hasattr(message, 'text') and message.text:
+            message_text = message.text
+            logger.debug(f"Using message.text: '{message_text}'")
+        elif hasattr(message, 'raw_text') and message.raw_text:
+            message_text = message.raw_text
+            logger.debug(f"Using message.raw_text: '{message_text}'")
+            
+        # Try one more approach - directly access the internal dictionary
+        if not message_text and hasattr(message, 'to_dict'):
+            try:
+                msg_dict = message.to_dict()
+                logger.debug(f"Message dictionary: {msg_dict}")
+                if 'message' in msg_dict:
+                    message_text = msg_dict['message']
+                    logger.debug(f"Found text in dictionary: '{message_text}'")
+            except Exception as e:
+                logger.debug(f"Failed to extract from dictionary: {str(e)}")
+            
+        # Handle case with media but no text
+        if not message_text and message.media:
+            media_type = type(message.media).__name__.replace('MessageMedia', '')
+            message_text = f"[Message with {media_type}]"
+            logger.debug(f"Using media type indicator: '{message_text}'")
+        elif not message_text:
+            message_text = "[Empty message]"
+            logger.debug("Using empty message indicator")
+            
+        # Format the message text
+        formatted_text = f"{prefix}**{sender_name}:** {message_text}"
+        logger.debug(f"Final formatted text: '{formatted_text}'")
+            
+        return {
+            "text": formatted_text,
+            "media": message.media,
+            "entities": message.entities
+        }
+    
     async def _handle_new_message(self, event):
         """Handle new message event"""
         chat_id = event.chat_id
+        message = event.message
         
-        # More detailed logging for message investigation
-        logger.debug(f"Received message: {event.message}")
+        # Get message text now for logging
+        message_text = ""
+        if hasattr(message, 'message') and message.message:
+            message_text = message.message
+        elif hasattr(message, 'text') and message.text:
+            message_text = message.text
+        elif hasattr(message, 'raw_text') and message.raw_text:
+            message_text = message.raw_text
+        
+        # Log full message details for debugging 
+        logger.debug(f"Received message object: {message}")
+        logger.debug(f"Message text (message attr): '{getattr(message, 'message', None)}'")
+        logger.debug(f"Message text (text attr): '{getattr(message, 'text', None)}'")
+        logger.debug(f"Message text (raw_text attr): '{getattr(message, 'raw_text', None)}'")
+        logger.debug(f"Extracted message text: '{message_text}'")
+        
+        # Add the extracted text as a custom attribute for later use
+        setattr(message, '_extracted_text', message_text)
+        
+        # Get sender ID for user filtering
+        sender_id = None
+        try:
+            sender = await message.get_sender()
+            if sender:
+                sender_id = sender.id
+        except Exception as e:
+            logger.error(f"Error getting sender: {str(e)}")
+        
+        # Log detailed info for message investigation
         logger.debug(f"Chat ID: {chat_id}")
+        logger.debug(f"Sender ID: {sender_id}")
         
         # Multiple ways to get topic ID depending on Telegram client version and message type
         topic_id = None
@@ -386,10 +676,9 @@ class TelegramForwarder:
             logger.error(f"Error detecting forum/topic: {str(e)}")
         
         logger.debug(f"Topic ID: {topic_id}")
-        logger.debug(f"Forwarding rules: {self.forwarding_rules}")
         
-        # Check if we should forward this message
-        forwarding_info = await self._should_forward(chat_id, topic_id)
+        # Check if we should forward this message based on chat, topic, and user
+        forwarding_info = await self._should_forward(chat_id, topic_id, sender_id)
         
         if forwarding_info:
             logger.info(f"Will forward message with info: {forwarding_info}")
@@ -398,29 +687,81 @@ class TelegramForwarder:
             can_forward = await self._can_forward_from_chat(chat_id)
             logger.debug(f"Can forward directly from chat {chat_id}: {can_forward}")
             
-            await self._forward_message(event, forwarding_info, topic_id, can_forward)
+            # Process and handle the message
+            await self._process_and_forward_message(event, forwarding_info, topic_id, can_forward)
         else:
-            logger.debug(f"No forwarding rules matched for chat {chat_id}, topic {topic_id}")
+            logger.debug(f"No forwarding rules matched for chat {chat_id}, topic {topic_id}, user {sender_id}")
     
-    async def _forward_message(self, event, forwarding_info, topic_id=None, can_forward_directly=True):
-        """Forward a message to the target chat/topic"""
+    async def _process_and_forward_message(self, event, forwarding_info, topic_id=None, can_forward_directly=True):
+        """Process and forward a message with all the new features applied"""
         message = event.message
         chat_id = event.chat_id
         
+        # Additional content to include in the forwarded message
+        additional_content = []
+        
+        # 1. Check if this message is a reply to another message
+        is_genuine_reply = False
+        if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
+            # In topics: a genuine reply has reply_to_msg_id different from the topic_id
+            if hasattr(message.reply_to, 'forum_topic') and message.reply_to.forum_topic and topic_id:
+                # It's a genuine reply only if reply_to_msg_id != topic_id
+                is_genuine_reply = message.reply_to.reply_to_msg_id != topic_id
+            else:
+                # Outside of topics, any reply_to is a genuine reply
+                is_genuine_reply = True
+                
+            if is_genuine_reply:
+                try:
+                    # Get the message being replied to
+                    replied_msg_id = message.reply_to.reply_to_msg_id
+                    logger.debug(f"Message is a genuine reply to message ID: {replied_msg_id}")
+                    
+                    replied_msg = await self.client.get_messages(chat_id, ids=replied_msg_id)
+                    
+                    if replied_msg:
+                        # Format the replied message
+                        formatted_reply = await self._format_message_for_forwarding(replied_msg, is_reply=True)
+                        additional_content.append(formatted_reply)
+                        logger.debug(f"Added replied-to message {replied_msg_id} to forwarded content")
+                    else:
+                        logger.debug(f"Could not find replied-to message with ID {replied_msg_id}")
+                except Exception as e:
+                    logger.error(f"Error processing replied message: {str(e)}")
+            else:
+                logger.debug(f"Message in topic {topic_id} is not a genuine reply (reply_to_msg_id={message.reply_to.reply_to_msg_id})")
+        
+        # 2. Extract and process message links in the text
+        message_links = []
+        if message.text:
+            message_links = await self._extract_message_links(message.text)
+            
+        for link_data in message_links:
+            try:
+                linked_msg = await self._fetch_linked_message(link_data)
+                
+                if linked_msg:
+                    # Format the linked message
+                    link_reference = link_data['full_match']
+                    formatted_link = await self._format_message_for_forwarding(linked_msg, linked_from=link_reference)
+                    additional_content.append(formatted_link)
+                    logger.debug(f"Added linked message {link_data['message_id']} to forwarded content")
+            except Exception as e:
+                logger.error(f"Error processing message link {link_data['full_match']}: {str(e)}")
+        
+        # Now forward the message with all additional content
         for target in forwarding_info:
             try:
                 to_chat = target["to_chat"]
                 to_topic = target.get("to_topic")
                 include_source = target.get("include_source", True)
                 
-                # Try direct forwarding first if channel allows it
-                # if can_forward_directly and not include_source:
-                if can_forward_directly:
+                # If we can directly forward and there's no additional content
+                if can_forward_directly and not additional_content:
                     try:
                         logger.debug(f"Attempting direct forwarding from {chat_id} to {to_chat}")
                         
                         # Direct forward (preserves original message formatting, attachments, etc.)
-                        # Note: forward_messages() doesn't support reply_to, so we need to handle it separately
                         forwarded_msg = await self.client.forward_messages(
                             int(to_chat),
                             message
@@ -452,7 +793,6 @@ class TelegramForwarder:
                         logger.error(f"Unexpected error during direct forwarding: {str(e)}")
                         # Fall through to text-based forwarding
                 
-                # Text-based forwarding (for channels with restrictions or when source info needed)
                 # Get chat and topic names for source attribution
                 chat_title = await self._get_chat_title(chat_id)
                 source_info = f"📨 Forwarded from: {chat_title}"
@@ -462,32 +802,76 @@ class TelegramForwarder:
                     if topic_name:
                         source_info += f" | {topic_name}"
                 
-                # Forward content based on message type
-                if message.text:
+                # Prepare main message text
+                message_text = ""
+                
+                # Try to get message text from various attributes
+                if hasattr(message, 'message') and message.message:
+                    message_text = message.message
+                elif hasattr(message, 'text') and message.text:
+                    message_text = message.text
+                elif hasattr(message, 'raw_text') and message.raw_text:
+                    message_text = message.raw_text
+                
+                # Log the extracted text for debugging
+                logger.debug(f"Main message text for forwarding: '{message_text}'")
+                
+                if message_text:
                     # Text message
-                    text = f"{source_info}\n\n{message.text}" if include_source else message.text
-                    await self.client.send_message(
-                        to_chat, 
-                        text, 
-                        reply_to=to_topic,
-                        formatting_entities=message.entities,
-                        file=message.media if message.media else None
-                    )
+                    text = f"{source_info}\n\n{message_text}" if include_source else message_text
                 elif message.media:
                     # Media message without text
-                    text = source_info if include_source else ""
-                    await self.client.send_message(
-                        to_chat,
-                        text if text else None,
-                        reply_to=to_topic,
-                        file=message.media
-                    )
+                    media_type = type(message.media).__name__.replace('MessageMedia', '')
+                    text = f"{source_info}\n\n[Message with {media_type}]" if include_source else f"[Message with {media_type}]"
                 else:
                     # Other message types (if any)
-                    logger.warning(f"Unsupported message type from {chat_id}, skipping")
-                    continue
+                    text = f"{source_info}\n\n[Empty message]" if include_source else "[Empty message]"
                 
-                logger.info(f"Forwarded message from {chat_id} to {to_chat} via text-based method")
+                # Append additional content (replied-to messages, linked messages)
+                if additional_content:
+                    text += "\n\n" + "\n\n".join([content["text"] for content in additional_content])
+                
+                # Check if media is a webpage preview (cannot be forwarded as a file)
+                sendable_media = None
+                if message.media and not isinstance(message.media, MessageMediaWebPage):
+                    sendable_media = message.media
+                
+                # Process and handle additional content (linked media) separately
+                # Prepare a list of media files to send
+                additional_media = []
+                
+                for content in additional_content:
+                    # Only include non-webpage media
+                    if content["media"] and not isinstance(content["media"], MessageMediaWebPage):
+                        additional_media.append({
+                            "chat_id": to_chat,
+                            "topic_id": to_topic,
+                            "media": content["media"]
+                        })
+                
+                # Send the main message first
+                await self.client.send_message(
+                    to_chat, 
+                    text, 
+                    reply_to=to_topic,
+                    formatting_entities=message.entities,
+                    file=sendable_media
+                )
+                
+                # Then send any additional media from linked messages as separate messages
+                for media_item in additional_media:
+                    try:
+                        await self.client.send_message(
+                            media_item["chat_id"],
+                            "📎 Additional media from referenced message",
+                            reply_to=media_item["topic_id"],
+                            file=media_item["media"]
+                        )
+                        logger.info(f"Sent additional media to {to_chat}")
+                    except Exception as e:
+                        logger.error(f"Failed to send additional media: {str(e)}")
+                
+                logger.info(f"Forwarded message from {chat_id} to {to_chat} with additional content")
             except Exception as e:
                 logger.error(f"Failed to forward message: {str(e)}")
     
@@ -510,14 +894,27 @@ class TelegramForwarder:
                     print("Skipping rule creation. You can edit forwarding_rules.json manually later.")
                     return
                 
+                # Ask if they want to filter by user IDs
+                use_user_filter = input("Do you want to filter messages by user IDs? (y/n): ").lower() == 'y'
+                user_ids = []
+                
+                if use_user_filter:
+                    user_input = input("Enter comma-separated list of user IDs to forward messages from: ")
+                    if user_input:
+                        user_ids = [int(user_id.strip()) for user_id in user_input.split(',') if user_id.strip()]
+                
                 # Create a simple rule
+                rule = {
+                    "chat_id": dest_chat,
+                    "topic_id": None
+                }
+                
+                # Add user_ids filter if provided
+                if user_ids:
+                    rule["user_ids"] = user_ids
+                
                 self.forwarding_rules[source_chat] = {
-                    "*": [
-                        {
-                            "chat_id": dest_chat,
-                            "topic_id": None
-                        }
-                    ]
+                    "*": [rule]
                 }
                 
                 # Save the rules
@@ -525,7 +922,10 @@ class TelegramForwarder:
                     json.dump(self.forwarding_rules, f, indent=4)
                 
                 print("\nForwarding rule created successfully!")
-                print(f"All messages from {source_chat} will be forwarded to {dest_chat}")
+                message = f"All messages from {source_chat} will be forwarded to {dest_chat}"
+                if user_ids:
+                    message += f" (but only from users with IDs: {user_ids})"
+                print(message)
             else:
                 print("\nNo problem! You can edit forwarding_rules.json manually later.")
                 print("See the README.md file for examples of how to configure forwarding rules.")
@@ -638,6 +1038,48 @@ class TelegramForwarder:
                 except Exception as e:
                     await event.respond(f"Error debugging chat: {str(e)}")
         
+        @self.client.on(events.NewMessage(pattern=r'^/debuglinks$'))
+        async def debug_links_handler(event):
+            """Debug command to test message link extraction from the current message"""
+            if event.is_private:
+                message = event.message
+                
+                if not message.text:
+                    await event.respond("No text in message to extract links from.")
+                    return
+                
+                # Extract links from the message
+                message_links = await self._extract_message_links(message.text)
+                
+                if not message_links:
+                    await event.respond("No Telegram message links found in the message.")
+                    return
+                
+                # Debug message
+                debug_info = "Extracted message links:\n\n"
+                
+                for idx, link_data in enumerate(message_links, 1):
+                    debug_info += f"Link {idx}:\n"
+                    debug_info += f"- Full match: {link_data['full_match']}\n"
+                    debug_info += f"- Chat ID: {link_data.get('chat_id', 'N/A')}\n"
+                    debug_info += f"- Username: {link_data.get('username', 'N/A')}\n"
+                    debug_info += f"- Message ID: {link_data['message_id']}\n"
+                    debug_info += f"- Topic ID: {link_data.get('topic_id', 'N/A')}\n\n"
+                    
+                    # Try to fetch the message
+                    try:
+                        linked_msg = await self._fetch_linked_message(link_data)
+                        if linked_msg:
+                            debug_info += f"Successfully fetched message content!\n"
+                            debug_info += f"- Text: {linked_msg.text[:100]}{'...' if len(linked_msg.text or '') > 100 else ''}\n"
+                            debug_info += f"- Has media: {linked_msg.media is not None}\n\n"
+                        else:
+                            debug_info += f"Could not fetch message content.\n\n"
+                    except Exception as e:
+                        debug_info += f"Error fetching message: {str(e)}\n\n"
+                
+                await event.respond(debug_info)
+        
         @self.client.on(events.NewMessage(pattern=r'^/help$'))
         async def help_handler(event):
             """Show help information about available commands"""
@@ -645,6 +1087,7 @@ class TelegramForwarder:
                 help_text = "Telegram Forwarder - Debug Commands\n\n"
                 help_text += "/debugtopic - Show topic information for the current message\n"
                 help_text += "/debugchat -100xxxx - Show information about a specific chat\n"
+                help_text += "/debuglinks - Test message link extraction from your message\n"
                 help_text += "/help - Show this help message\n"
                 
                 await event.respond(help_text)

@@ -7,6 +7,10 @@ A Python-based tool that automatically forwards messages between Telegram chats 
 - **User Account Authentication**: Operates under your Telegram user credentials (not a bot)
 - **Flexible Forwarding Rules**: Configure forwarding by chat or specific topics
 - **Topic Support**: Full support for Telegram topics in both source and destination chats
+- **User Filtering**: Forward messages only from specific users
+- **Reply Content Forwarding**: Includes the original message content when forwarding replies
+- **Message Link Processing**: Automatically includes content from any Telegram message links in the text
+- **Media Handling**: Properly forwards media attachments from both original messages and linked content
 - **MTProto Proxy Support**: Connect through MTProto proxy for enhanced privacy/accessibility
 - **Source Attribution**: Automatically includes source chat/topic information in forwarded messages
 - **Performance Optimized**: Caches chat entities and topic information for faster operation
@@ -43,10 +47,15 @@ Contains your Telegram API credentials and proxy settings:
 {
     "api_id": 123456,
     "api_hash": "your_api_hash_here",
+    "proxy": {
+        "type": "",
+        "server": "",
+        "port": 0
+    }
 }
 ```
 
-`"proxy"` can be left unconfigured.
+`"proxy"` can be left unconfigured if not needed.
 
 ### 2. `forwarding_rules.json`
 
@@ -66,7 +75,8 @@ Defines which messages should be forwarded and where:
         "1": [
             {
                 "chat_id": "-100444555666",
-                "topic_id": 123
+                "topic_id": 123,
+                "user_ids": [12345678, 87654321]
             }
         ],
         "2": [
@@ -77,7 +87,7 @@ Defines which messages should be forwarded and where:
         ],
         "3": [
             {
-                "chat_id": "lilfeel",
+                "chat_id": "@username",
                 "topic_id": null
             }
         ]
@@ -87,9 +97,23 @@ Defines which messages should be forwarded and where:
 
 In this example:
 - All messages from chat `-100123456789` will be forwarded to chat `-100987654321`
-- Messages from topic `1` in chat `-100111222333` will be forwarded to topic `123` in chat `-100444555666`
+- Messages from topic `1` in chat `-100111222333` will be forwarded to topic `123` in chat `-100444555666`, but only if sent by users with IDs `12345678` or `87654321`
 - Messages from topic `2` in chat `-100111222333` will be forwarded to chat `-100777888999` (no specific topic)
-- Messages from topic `3` in chat `-100111222333` will be forwarded to `@lilfeel` (no specific topic)
+- Messages from topic `3` in chat `-100111222333` will be forwarded to `@username` (no specific topic)
+
+### Special Features Configuration
+
+#### User Filtering
+Add a `user_ids` array to any forwarding rule to only forward messages from specific users:
+```json
+"user_ids": [12345678, 87654321]
+```
+
+#### Reply and Link Forwarding
+The script automatically:
+- Includes content of messages being replied to in the forwarded message
+- Detects Telegram message links in the text (like `https://t.me/c/1234567890/123`) and includes the linked message content
+- Handles media attachments from both the original message and any linked content
 
 ## Getting Started
 
@@ -105,7 +129,8 @@ In this example:
 Edit the `forwarding_rules.json` file to specify your forwarding rules:
 
 - Use `"*"` to forward all messages from a chat
-- Or specify topic IDs to forward only specific topics
+- Specify topic IDs to forward only specific topics
+- Add `user_ids` array to filter by specific users
 
 **Finding Chat IDs:**
 - Forward a message from the chat to @userinfobot
@@ -115,7 +140,11 @@ Edit the `forwarding_rules.json` file to specify your forwarding rules:
 - Open the topic in a web browser
 - The topic ID is the number at the end of the URL (after "/topic/")
 
-### Step 4: Run the Forwarder
+**Finding User IDs:**
+- Forward a message from the user to @userinfobot
+- The user ID will be displayed
+
+### Step 3: Run the Forwarder
 
 Start the forwarder:
 
@@ -123,54 +152,17 @@ Start the forwarder:
 python forwarder.py
 ```
 
-The script will connect to Telegra (you will have to input your phone number, code, and 2fa) and begin forwarding messages according to your rules.
-
-## Running as a Service
-
-For 24/7 operation, it's recommended to run the forwarder as a service.
-
-### Using systemd (Linux)
-
-Create a systemd service file:
+Or use the setup mode to interactively configure the forwarder:
 
 ```bash
-sudo nano /etc/systemd/system/telegram-forwarder.service
+python forwarder.py setup
 ```
 
-Add the following content:
-
-```
-[Unit]
-Description=Telegram Message Forwarder
-After=network.target
-
-[Service]
-User=yourusername
-WorkingDirectory=/path/to/telegram-forwarder
-ExecStart=/usr/bin/python3 /path/to/telegram-forwarder/forwarder.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
-
-```bash
-sudo systemctl enable telegram-forwarder
-sudo systemctl start telegram-forwarder
-```
-
-Check status:
-
-```bash
-sudo systemctl status telegram-forwarder
-```
+The script will connect to Telegram (you will have to input your phone number, code, and 2FA if enabled) and begin forwarding messages according to your rules.
 
 ### Using screen
 
-You can also use `screen` to run your script.
+You can also use `screen` to run your script in the background:
 
 ```bash
 screen -S tg_forwarder # open a new screen
@@ -180,12 +172,21 @@ python3 forwarder.py # run the script inside the screen
 # Press Ctrl+A and then D to detach the session
 ```
 
-Then, when you need to see the session again, reattach
+Then, when you need to see the session again, reattach:
 ```bash
 screen -r tg_forwarder
 
 # Press Ctrl+A and then D to detach the session again
 ```
+
+## Debug Commands
+
+The forwarder provides several debug commands when you message the bot privately:
+
+- `/debugtopic` - Show topic information for your message
+- `/debugchat -100xxxx` - Show information about a specific chat
+- `/debuglinks` - Test message link extraction from your message
+- `/help` - Show all available commands
 
 ## Security Considerations
 
