@@ -11,10 +11,11 @@ import sys
 import json
 import asyncio
 import argparse
+import logging
 from pathlib import Path
 
 from src.logger import setup_logger
-from src.forwarder import TelegramForwarder
+from src.forwarder.core import TelegramForwarder
 from src.config import load_json, save_json
 
 # Setup logger
@@ -93,6 +94,12 @@ async def main():
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Set logging level")
     args = parser.parse_args()
+
+    # Set log level
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logger.setLevel(log_level)
+    for handler in logger.handlers:
+        handler.setLevel(log_level)
 
     # Run setup wizard if requested
     if args.setup:
