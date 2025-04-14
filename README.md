@@ -15,6 +15,8 @@ A Python-based tool that automatically forwards messages between Telegram chats 
 - **Source Attribution**: Automatically includes source chat/topic information in forwarded messages
 - **Performance Optimized**: Caches chat entities and topic information for faster operation
 - **Detailed Logging**: Comprehensive logging for monitoring and troubleshooting
+- **Docker Support**: Easy deployment with Docker and Docker Compose
+- **Auto-restart Capability**: Both Docker and WSL scripts ensure the forwarder stays running
 
 ## Requirements
 
@@ -24,15 +26,70 @@ A Python-based tool that automatically forwards messages between Telegram chats 
 
 ## Installation
 
+### Option 1: Standard Python Installation
+
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/telegram-forwarder.git
+   git clone git@github.com:DimaPhil/telegram_forwarder.git
    cd telegram-forwarder
    ```
 
 2. Install the required dependencies:
    ```bash
-   pip install telethon
+   pip install -r requirements.txt
+   ```
+
+3. Configure `config.json` and `forwarding_rules.json` with your implied data (more about that below)
+ 
+4. Run the setup wizard:
+   ```bash
+   python main.py
+   ```
+
+### Option 2: Docker Installation
+
+1. Clone this repository:
+   ```bash
+   git clone git@github.com:DimaPhil/telegram_forwarder.git
+   cd telegram-forwarder
+   ```
+
+2. Create your configuration files (`config.json` and `forwarding_rules.json`) or run the setup wizard first:
+   ```bash
+   python main.py --setup
+   ```
+
+3. Build and start with Docker Compose:
+   ```bash
+   docker compose up -d
+   ```
+
+### Option 3: Windows WSL Installation
+
+1. Clone this repository:
+   ```bash
+   git clone git@github.com:DimaPhil/telegram_forwarder.git
+   cd telegram-forwarder
+   ```
+
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. Run the setup wizard and then configure `config.json` and `forwarding_rules.json`:
+   ```bash
+   python main.py --setup
+   ```
+
+4. Make the WSL script executable:
+   ```bash
+   chmod +x run_wsl.sh
+   ```
+
+5. Run the WSL script:
+   ```bash
+   ./run_wsl.sh
    ```
 
 ## Configuration
@@ -101,19 +158,57 @@ In this example:
 - Messages from topic `2` in chat `-100111222333` will be forwarded to chat `-100777888999` (no specific topic)
 - Messages from topic `3` in chat `-100111222333` will be forwarded to `@username` (no specific topic)
 
-### Special Features Configuration
+## Running the Forwarder
 
-#### User Filtering
-Add a `user_ids` array to any forwarding rule to only forward messages from specific users:
-```json
-"user_ids": [12345678, 87654321]
+### Option 1: Standard Python
+
+```bash
+python main.py
 ```
 
-#### Reply and Link Forwarding
-The script automatically:
-- Includes content of messages being replied to in the forwarded message
-- Detects Telegram message links in the text (like `https://t.me/c/1234567890/123`) and includes the linked message content
-- Handles media attachments from both the original message and any linked content
+Command-line options:
+- `--setup`: Run the interactive setup wizard
+- `--config PATH`: Specify a custom config file path (default: `config.json`)
+- `--rules PATH`: Specify a custom rules file path (default: `forwarding_rules.json`)
+- `--session PATH`: Specify a custom session file path (default: `telegram_session`)
+- `--log-level LEVEL`: Set logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+
+### Option 2: Docker Compose
+
+Start the forwarder:
+```bash
+docker compose up -d
+```
+
+Stop the forwarder:
+```bash
+docker compose down
+```
+
+View logs:
+```bash
+docker compose logs -f
+```
+
+### Option 3: WSL Script
+
+Start the forwarder with auto-restart capability:
+```bash
+./run_wsl.sh
+```
+
+Stop the forwarder:
+```bash
+./stop_wsl.sh
+```
+
+## Logging
+
+Logs are stored in the `logs` directory:
+- `telegram_forwarder.log`: Main application logs
+- `wsl_runner.log`: WSL runner logs (when using the WSL script)
+
+When using Docker, logs are also stored in the `logs` directory on your host system, thanks to the volume mapping in the Docker Compose file.
 
 ## Getting Started
 
@@ -146,38 +241,7 @@ Edit the `forwarding_rules.json` file to specify your forwarding rules:
 
 ### Step 3: Run the Forwarder
 
-Start the forwarder:
-
-```bash
-python forwarder.py
-```
-
-Or use the setup mode to interactively configure the forwarder:
-
-```bash
-python forwarder.py setup
-```
-
-The script will connect to Telegram (you will have to input your phone number, code, and 2FA if enabled) and begin forwarding messages according to your rules.
-
-### Using screen
-
-You can also use `screen` to run your script in the background:
-
-```bash
-screen -S tg_forwarder # open a new screen
-
-python3 forwarder.py # run the script inside the screen
-
-# Press Ctrl+A and then D to detach the session
-```
-
-Then, when you need to see the session again, reattach:
-```bash
-screen -r tg_forwarder
-
-# Press Ctrl+A and then D to detach the session again
-```
+Choose one of the running methods described above. When run for the first time, you'll be prompted to enter your phone number and verification code to authenticate with Telegram.
 
 ## Debug Commands
 

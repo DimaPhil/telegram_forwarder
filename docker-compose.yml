@@ -1,0 +1,15 @@
+version: '3'
+
+services:
+  telegram-forwarder:
+    build: .
+    container_name: telegram-forwarder
+    volumes:
+      - ./config.json:/app/config.json
+      - ./forwarding_rules.json:/app/forwarding_rules.json
+      - ./logs:/app/logs
+      - ./telegram_session.session:/app/telegram_session.session
+    restart: unless-stopped
+    command: python main.py
+    environment:
+      - TZ=UTC
