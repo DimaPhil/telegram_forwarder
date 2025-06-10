@@ -15,5 +15,8 @@ RUN mkdir -p logs
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
+# Create session file and set permissions
+RUN touch /app/telegram_session.session     && chown root:root /app/telegram_session.session
+
 # Run the forwarder
 CMD ["python", "main.py"]
